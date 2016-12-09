@@ -7,6 +7,10 @@ const supportMultiple = (typeof document !== 'undefined' && document && document
   'multiple' in document.createElement('input') :
   true;
 
+const walkDirectory = Symbol('walk directory');
+const readEntries = Symbol('read entries');
+const toArray = Symbol('to array');
+
 class Dropzone extends React.Component {
   constructor(props, context) {
     super(props, context);
@@ -51,8 +55,8 @@ class Dropzone extends React.Component {
     // But Chrome implements some drag store, which is accesible via dataTransfer.items
     const dataTransferItems = e.dataTransfer && e.dataTransfer.items ? e.dataTransfer.items : [];
 
-    // Now we need to convert the DataTransferList to Array
-    const allFilesAccepted = this.allFilesAccepted(Array.prototype.slice.call(dataTransferItems));
+    // Now we need to convert the dataTransferItems to an Array
+    const allFilesAccepted = this[toArray](dataTransferItems).every(file => accepts(file, this.props.accept));
 
     this.setState({
       isDragActive: allFilesAccepted,
@@ -104,39 +108,55 @@ class Dropzone extends React.Component {
       isDragReject: false
     });
 
-    const droppedFiles = e.dataTransfer ? e.dataTransfer.files : e.target.files;
-    const max = this.props.multiple ? droppedFiles.length : Math.min(droppedFiles.length, 1);
-    const acceptedFiles = [];
-    const rejectedFiles = [];
+    let droppedFiles = e.dataTransfer ? e.dataTransfer.files : e.target.files;
+    const dataTransferItems = e.dataTransfer && e.dataTransfer.items ? e.dataTransfer.items : [];
 
-    for (let i = 0; i < max; i++) {
-      const file = droppedFiles[i];
-      // We might want to disable the preview creation to support big files
-      if (!this.props.disablePreview) {
-        file.preview = window.URL.createObjectURL(file);
-      }
+    const wrapup = () => {
+      const max = this.props.multiple ? droppedFiles.length : Math.min(droppedFiles.length, 1);
+      const acceptedFiles = [];
+      const rejectedFiles = [];
 
-      if (this.fileAccepted(file) && this.fileMatchSize(file)) {
+      for (let i = 0; i < max; i++) {
+        const file = droppedFiles[i];
+
+        if (!this.fileAccepted(file) || !this.fileMatchSize(file)) {
+          rejectedFiles.push(file);
+          continue;
+        }
+
+        // We might want to disable the preview creation to support big files
+        if (!this.props.disablePreview) {
+          file.preview = window.URL.createObjectURL(file);
+        }
         acceptedFiles.push(file);
-      } else {
-        rejectedFiles.push(file);
       }
-    }
 
-    if (this.props.onDrop) {
-      this.props.onDrop.call(this, acceptedFiles, rejectedFiles, e);
-    }
+      if (this.props.onDrop) {
+        this.props.onDrop.call(this, acceptedFiles, e);
+      }
 
-    if (rejectedFiles.length > 0) {
-      if (this.props.onDropRejected) {
+      if (this.props.onDropRejected && rejectedFiles.length) {
         this.props.onDropRejected.call(this, rejectedFiles, e);
       }
-    } else if (acceptedFiles.length > 0) {
-      if (this.props.onDropAccepted) {
+
+      if (this.props.onDropAccepted && acceptedFiles.length) {
         this.props.onDropAccepted.call(this, acceptedFiles, e);
       }
+
+      this.isFileDialogActive = false;
+    };
+
+    if (dataTransferItems[0] && typeof dataTransferItems[0].webkitGetAsEntry === 'function') {
+      const entry = dataTransferItems[0].webkitGetAsEntry();
+
+      return this[walkDirectory](entry.filesystem.root, walkedFiles => {
+        droppedFiles = walkedFiles;
+        wrapup();
+      });
     }
-    this.isFileDialogActive = false;
+    wrapup();
+
+    return false;
   }
 
   onClick() {
@@ -180,6 +200,69 @@ class Dropzone extends React.Component {
     this.isFileDialogActive = true;
     this.fileInputEl.value = null;
     this.fileInputEl.click();
+  }
+
+  [walkDirectory](directory, callback) {
+    let results = [];
+
+    if (directory === null) {
+      return callback(results);
+    }
+
+    return this[readEntries](directory, (err, result) => {
+      if (err) {
+        return callback(err);
+      }
+
+      const entries = result.slice();
+
+      const processEntry = () => {
+        const current = entries.shift();
+
+        if (current === undefined) {
+          return callback(results);
+        }
+
+        if (current.isDirectory) {
+          return this[walkDirectory](current, nestedResults => {
+            results = results.concat(nestedResults);
+            processEntry();
+          });
+        }
+
+        return current.file(file => {
+          results.push(file);
+          return processEntry();
+        }, processEntry);
+      };
+      return processEntry();
+    });
+  }
+
+  [readEntries](directory, callback, readerSupplied) {
+    let entries = [];
+    // reader should not be present on initial call
+    const reader = readerSupplied || directory.createReader();
+
+    return reader.readEntries(results => {
+      if (!results.length) {
+        return callback(null, entries);
+      }
+
+      entries = entries.concat(this[toArray](results));
+      return this[readEntries](directory, (err, additionalEntries) => {
+        if (err) {
+          return callback(err);
+        }
+
+        entries = entries.concat(additionalEntries);
+        return callback(null, entries);
+      }, reader);
+    }, callback);
+  }
+
+  [toArray](obj) {
+    return Array.prototype.slice.call(obj || [], 0);
   }
 
   render() {
